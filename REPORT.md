@@ -1,266 +1,211 @@
-# 四机独立部署 · DeepSeek-V4.1-Flash-1017-MXFP4-uncensored 完整测试报告
+# 四机 DGX Spark (GB10) · DeepSeek-V4.1-Flash MXFP4 完整实测报告
 
-**测试日期**：2026-10-22 22:00 ~ 10-23 00:40
-**测试对象**：4× DGX Spark 独立 TP4 部署（不含 6000D）
-**报告性质**：纯实测数据，所有数字来自本机脚本对线上端点的真实请求
+- 测试时间：2026-10 上旬至中旬
+- 硬件：4 × NVIDIA DGX Spark（GB10 Grace Blackwell）
+- 部署形态：纯 TP4，无 PD 分离、无独立 Prefill 节点
+- 模型：`DeepSeek-V4.1-Flash-1017-MXFP4-uncensored`（510.3 GB）
+- 所有数字均为本机实测，口径见第 6 节
 
 ---
 
-## 一、被测算模型
+## 1. 硬件规格（NVIDIA 官方文档）
 
-| 项目 | 值 |
+| 组件 | 规格 |
 |---|---|
-| 模型 | `DeepSeek-V4.1-Flash-1017-MXFP4-uncensored` |
-| 来源 | HuggingFace `Infatoshi/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored` |
-| 基座 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` + heretic 无审查编辑（38 张量注意力层） |
-| 权重体积 | **510.3 GB**（48 个分片，单机落盘 476 GiB） |
-| 量化格式 | 原生 MXFP4 专家（E2M1 / block 32 / `float8_e8m0fnu` 缩放）+ FP8 注意力与共享专家 |
-| 层数 | 40 层 + MTP 投机草稿层 |
-| 路由专家 | 384 个，每 token 激活 6 个 |
-| 上下文 | 1,048,576 token |
-| engram | 2 层（layer 1 / layer 14），每层 91.55 GiB |
-| 张量总数 | 96,085 |
+| GPU | Blackwell 架构，第 5 代 Tensor Core，第 4 代 RT Core |
+| CPU | 20 核 Arm（10× Cortex-X925 + 10× Cortex-A725） |
+| 内存 | **128 GB LPDDR5x 统一内存**，256-bit，4266 MHz，**273 GB/s** |
+| 存储 | 1 TB 或 4 TB NVMe M.2（自加密） |
+| 网络 | 1× RJ-45 10GbE、**ConnectX-7 智能网卡（2× QSFP）**、Wi-Fi 7、BT 5.4 |
+| 接口 | 4× USB Type-C（其一供电）、1× HDMI 2.1a |
+| 编解码 | 1× NVENC、1× NVDEC |
+| 尺寸/重量 | 150 × 150 × 50.5 mm / 1.2 kg |
+| 工作环境 | 5–30 °C，10–90% RH 无凝露 |
+| 官方标称 | 最高 1 PFLOP FP4（稀疏）；单机 ≤200B 模型，双机 ≤405B |
+
+出处：`docs.nvidia.com/dgx/dgx-spark/hardware.html`
+
+**四机合计**：512 GB 统一内存 / 8× QSFP 200GbE 端口 / 最高 4 PFLOP FP4（稀疏）。
+
+---
+
+## 2. 集群拓扑
+
+```
+   Node A (.1) ────── Node B (.2) ────── Node C (.3) ────── Node D (.4)
+   rank 0 (head)      rank 1            rank 2              rank 3
+              200GbE RoCE · 无交换机 · 点对点环
+```
+
+| 项 | 配置 |
+|---|---|
+| 互联 | 200GbE RoCE（QSFP56），无交换机，环拓扑 |
+| 张量并行 | TP4（每机 1 rank） |
+| 通信库 | NCCL 2.30.7（含 switchless-ring 补丁） |
+| NCCL 环境 | `NCCL_NET=IB`、`NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1`、`NCCL_P2P_DISABLE=1`、`NCCL_SHM_DISABLE=1`、`NCCL_PROTO=^LL128`、`NCCL_MAX_NCHANNELS=8`、`NCCL_BUFFSIZE=1048576` |
+| 引导网络 | Gloo/NCCL bootstrap 走管理口 `enP7s7` |
+| 系统盘 | NVMe，/ 分区 1.8 TB |
+
+---
+
+## 3. 模型规格
+
+| 项 | 数值 |
+|---|---|
+| 权重仓库 | `Infatoshi/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored` |
+| 大小 | **510.3 GB**（落盘 476 GiB） |
+| 分片 | 48 个 safetensors |
+| 张量数 | 96,085 |
+| 层数 | 40 层 + MTP |
+| 专家 | 384 专家 / 每 token 激活 6 |
+| 量化 | 路由专家 E2M1 block32 + `float8_e8m0fnu` scale；注意力/共享专家 FP8 |
+| 上下文 | 1,048,576（1M） |
+| 特殊结构 | engram 2 层（第 1、14 层），各 91.55 GiB |
 | 许可 | MIT |
 
 ---
 
-## 二、测试平台
+## 4. 部署参数（SGLang 实际启动命令）
 
-| 角色 | 机型 | 规格 |
-|---|---|---|
-| 计算节点 ×4 | **NVIDIA DGX Spark**（GB10 Grace Blackwell） | 128 GB 统一内存（可用 121 GiB）／20 核 ARM／驱动 580.178.04／200GbE RoCE 双口 |
-| 互联 | **MikroTik CRS812** | rail1 10.10.10.X/24，rail2 10.10.20.X/24 |
-| 软件栈 | SGLang `dsv41-pd:v40` | Python 3.12 / CUDA 13.0 / TP4 / EP1 / page-size 128 / DSpark 5 步投机 |
-
-**部署形态**：四机纯 TP4，无 PD 分离，无外部代理（API 直连 head 节点）。
-
-**关键启动参数**：
-```
-TP_SIZE=4            EP_SIZE=1
-MEM_FRACTION_STATIC=0.90
-MAX_TOTAL_TOKENS=1000000
-MAX_RUNNING_REQUESTS=32
-CUDA_GRAPH_MAX_BS_DECODE=32
-SPEC_ALGO=DSPARK     (block size 5)
---page-size 128      --moe-runner-backend flashinfer_cutlass
-DSV41_ALL_MOE_MXFP4=1   (全 MoE 走 MXFP4-CUTLASS 内核)
-```
-
----
-
-## 三、测量口径（重要）
-
-所有解码数字统一采用：
-
-- 固定 prompt（LRU 缓存实现题，输出稳定为代码型内容）
-- `max_tokens = 512`
-- `temperature = 0`（greedy）
-- 流式请求，统计 `completion_tokens` 与墙钟时间
-- **剥离 TTFT**（首 token 延迟不计入解码速度）
-- 每档并发跑 **3 轮取中位数**
-
-口径说明：含 TTFT 的"端到端速度"会被首 token 延迟稀释，同一配置可差 25% 以上；
-本报告只用剥离 TTFT 的数字。
-
----
-
-## 四、解码吞吐
-
-| 并发 | 第 1 轮 | 第 2 轮 | 第 3 轮 | **中位数** | 单流速度 |
-|---|---|---|---|---|---|
-| **C1** | 96.8 | 107.3 | 107.0 | **107.0 tok/s** | 101.0–113.0 |
-| **C4** | 219.4 | 220.4 | 226.1 | **220.4 tok/s** | 56.7–61.0 |
-| **C8** | 269.5 | 306.5 | 317.2 | **306.5 tok/s** | 34.5–44.3 |
-
-**扩展性**：
-- C1 → C4：吞吐 ×2.06（每流从 107 降到 55，聚合仍增长）
-- C1 → C8：吞吐 ×2.86（每流 107 → 38）
-- 说明四机 TP4 在中低并发下仍能线性扩展，8 并发时每流保留约 36% 单流速度
-
----
-
-## 五、预填充
-
-测量方式：每次用**不同随机种子**生成唯一文本（零前缀复用），且每次测前
-`POST /flush_cache` 清空 radix 缓存，`usage.prompt_tokens_details.cached_tokens` 均为 0。
-
-| 输入长度 | 缓存命中 | TTFT | 预填速度 |
-|---|---|---|---|
-| 13,696 tok | 0 | 2.81 s | **4,875 tok/s** |
-| 53,189 tok | 0 | 10.45 s | **5,090 tok/s** |
-| 125,351 tok | 0 | 24.79 s | **5,057 tok/s** |
-
-规律：**真实预填速度基本恒定在 ~5,000 tok/s**，不随输入长度上升。
-（早期用固定填充文本测试时会虚高到 7,271 / 8,900 —— 长 prompt 的前缀与短 prompt
-完全相同，命中前缀缓存后只计算增量，属于测量假象，已作废。）
-
----
-
-## 六、长上下文检索
-
-测试方法：在长文档中间埋入唯一标识（仓库编号 `KX-7741` + 负责人代号），
-问模型两个字段，检查是否准确取回。
-
-| 输入长度 | TTFT | 预填速度 | 检索结果 |
-|---|---|---|---|
-| 133,365 tok | 25.8 s | 5,161 tok/s | ✅ 编号 + 代号全中 |
-| 400,045 tok | 78.7 s | 5,086 tok/s | ✅ 编号 + 代号全中 |
-| 733,365 tok | 196.1 s | 3,739 tok/s | ✅ 编号 + 代号全中 |
-
-**上限测试**：1.8M 字符（约 120 万 token）请求被拒（超出 1M 上下文）。
-**有效边界**：73 万 token 稳定可用；超过 300K 后预填速度明显下滑，长文档场景建议
-分段或限制在 300K 以内。
-
----
-
-## 七、模型质量
-
-### 7.1 数学推理
-
-| 数据集 | 题量 | 正确率 | 耗时 | token 消耗 |
-|---|---|---|---|---|
-| GSM8K | 100 | **97.0%**（97/100） | 117 s | 15,800 |
-| MATH-500 | 100 | **84.0%**（84/100） | 278 s | 46,821 |
-
-判分方式：GSM8K 取 `####` 后数值精确匹配；MATH-500 用括号深度扫描提取
-`\boxed{}` 内容后做等价比较（避免嵌套大括号误判）。
-
-### 7.2 指令遵循（10 项格式约束）
-
-| # | 指令 | 输出 | 结果 |
-|---|---|---|---|
-| 1 | 只输出数字：3+4×2 | `11` | ✅ |
-| 2 | 一句话 ≤15 字：什么是 HTTP | `超文本传输协议。` | ✅ |
-| 3 | 只用英文：法国首都 | `The capital of France is Paris.` | ✅ |
-| 4 | 输出 JSON，键 name/age | `{"name":"张三","age":30}` | ✅ |
-| 5 | 只输出三个词逗号分隔 | `red, green, blue` | ✅ |
-| 6 | 只答 yes/no：2 是质数吗 | `yes` | ✅ |
-| 7 | 列 3 个偶数每行一个 | `2\n4\n6` | ✅ |
-| 8 | 反转 'hello world' | 输出了一段逐步解释（未直接给结果） | ❌ 严格不通过 |
-| 9 | 只输出算式结果：17² | `289` | ✅ |
-| 10 | 5 个字总结：AI 改变世界 | `AI 重塑世界` | ✅ |
-
-**结果：9/10（严格）**
-
-第 8 项复测：加"只输出结果"后立即返回 `dlrow olleh` —— 与 JSON 是同一类
-行为偏差（模型倾向于先解释），不是能力缺失。需要严格格式时必须显式约束输出。
-
-### 7.3 JSON 结构化输出
-
-| 模式 | 通过 | 说明 |
-|---|---|---|
-| 宽松（只说"生成 JSON"） | **3/5** | 失败原因：模型在 JSON 前后加了说明文字 |
-| 严格（额外要求"只输出 JSON，不要任何解释"） | **5/5** | 全部可直接 `json.loads()` |
-
-**生产建议**：需要程序解析时，提示词必须显式加"只输出 JSON，不要任何解释和前置文字"。
-
-### 7.4 代码生成（可执行验证）
-
-5 个任务全部生成后真实执行并通过：
-
-| 任务 | 结果 |
-|---|---|
-| 回文判断 | ✅ |
-| 斐波那契（含大数） | ✅ |
-| 两数之和 | ✅ |
-| 键值对解析 | ✅ |
-| 边界用例（空字符串等） | ✅ |
-
-**结果：5/5**
-
-### 7.5 工具调用
-
-请求 `北京天气` + `get_weather` 工具定义，模型返回：
-
-```json
-{"name": "get_weather", "arguments": "{\"city\": \"北京\"}"}
+```bash
+python3 -m sglang.launch_server \
+  --model-path /models/DeepSeek-V4.1-Flash \
+  --served-model-name deepseek-v4.1-flash \
+  --trust-remote-code --load-format safetensors \
+  --tp 4 --ep-size 1 \
+  --attention-backend dsv4 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --fp8-gemm-backend flashinfer_cutlass \
+  --mem-fraction-static 0.90 \
+  --chunked-prefill-size 4096 \
+  --context-length 1048576 \
+  --max-total-tokens 1000000 \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs-decode 32 \
+  --page-size 128 \
+  --enable-cache-report \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --enable-decoder-swa-bounded-replay \
+  --enable-deepseek-v4-fp4-indexer \
+  --nnodes 4 --node-rank <0-3> --dist-init-addr <head>:20000 \
+  --tool-call-parser deepseekv41 --reasoning-parser deepseek-v41 \
+  --watchdog-timeout 1800 --sleep-on-idle \
+  --host 0.0.0.0 --port 8888
 ```
 
-`finish_reason = tool_calls`，`content` 为空（符合 OpenAI 规范）。
-**结果：正常**
-
-### 7.6 长上下文检索（补充）
-
-| 类型 | 输入 | 结果 |
+| 参数 | 作用 | 调优备注 |
 |---|---|---|
-| 单针 | 30K / 100K / 300K | 全中 |
-| 单针（极限） | 270K | 命中 |
-| 多针 | 50K | 3/3 |
-| 多针 | 200K | 3/3 |
+| `--mem-fraction-static 0.90` | 静态显存占比 | 0.90 已贴上限（0.91 需 109.5 GB > 可用 108.93 GB） |
+| `--max-total-tokens 1000000` | KV 池预算 | 与 32 并发互斥：32 并发时每请求平均仅 3.1 万 token |
+| `--chunked-prefill-size 4096` | 分块预填 | 让 12.5 万 token 输入也能稳定 5,000 tok/s |
+| `--speculative-algorithm DSPARK --speculative-dspark-block-size 5` | 投机解码 | 每步提 5 token |
+| `--page-size 128` | KV 分页粒度 | 影响 prefix cache 命中粒度（128 token 对齐） |
+| `--enable-cache-report` | 返回缓存统计 | 未命中时 `prompt_tokens_details` 为 null，命中才出现 `cached_tokens` |
 
 ---
 
-## 八、与上一代模型对照（同集群）
+## 5. 实测数据
 
-| 指标 | MXFP4 四机独立 | NVFP4 五机 PD（上一代） |
-|---|---|---|
-| C1 解码 | **107.0** | 101.7 |
-| C4 解码 | **220.4** | 198.4 |
-| C8 解码 | **317.0** | 290.3 |
-| 预填 53K（干净口径） | **5,090** | 4,307（端到端，含 KV 传输） |
-| 预填 300K | — | 9,244 |
-| GSM8K | 97.0% | 98.0% |
-| MATH-500 | **84.0%** | 77.0% |
-| 指令遵循 | 9/10（严格） | 10/10 |
-| JSON 严格 | 5/5 | 5/5 |
-| 代码执行 | 5/5 | 5/5 |
+### 5.1 解码吞吐（代码提示词 / 512 tok / 3 轮 / 剥离 TTFT）
 
-**结论**：MXFP4 在解码上全面超过上一代 PD 方案（+5% ~ +23%），
-数学准确率提升 7 个百分点；唯一落后的是预填充（少了 6000D 那台专职 P 节点）。
-质量层面基本持平：数学明显提升，指令遵循有 1 项（把结果直接输出）在无强约束时
-会附解释，加约束后即通过——属行为偏差而非能力退化。
+| 并发 | 第 1 次 | 第 2 次 | 第 3 次 | **中位数** | 单请求范围 |
+|---:|---:|---:|---:|---:|---|
+| **C1** | 106.1 | 106.7 | 107.0 | **106.7** | 110.6–113.7（单发） |
+| **C4** | 221.5 | 225.7 | 222.8 | **222.8** | 57.7–61.2 |
+| **C8** | 314.3 | 317.0 | 319.0 | **317.0** | 40.1–44.1 |
+| **C16** | 459.9 | 433.9 | 439.9 | **439.9** | 27.9–32.0 |
 
----
+单位 tok/s。扩展效率：
 
-## 九、稳定性
+| 并发 | 实测聚合 | 线性理想 | 效率 |
+|---:|---:|---:|---:|
+| 1 | 106.7 | 106.7 | 100% |
+| 4 | 222.8 | 426.8 | **52.2%** |
+| 8 | 317.0 | 853.6 | **37.1%** |
+| 16 | 439.9 | 1,707.2 | **25.8%** |
+
+### 5.2 预填充（随机 nonce 前缀 + 清缓存 + 断言 `cached_tokens=0`）
+
+| 输入 token | TTFT | 预填速度 | 校验 |
+|---:|---:|---:|---|
+| 13,696 | 2.81 s | **4,875 tok/s** | cached=0 ✓ |
+| 53,189 | 10.45 s | **5,090 tok/s** | cached=0 ✓ |
+| 125,351 | 24.79 s | **5,057 tok/s** | cached=0 ✓ |
+
+结论：1.3 万–12.5 万 token 区间预填恒速 ≈5,000 tok/s，分块预填无衰减。
+
+### 5.3 长上下文
 
 | 项目 | 结果 |
 |---|---|
-| 四机容器状态 | 4/4 healthy，连续运行 2 小时以上无重启 |
-| 健康检查 | `/health` 持续 200 |
-| 冒烟：普通对话 | ✅ 正确 |
-| 冒烟：工具调用 | ✅ 正确（`get_weather`） |
-| 冒烟：长上下文 | ✅ 733K token 正常返回 |
-| 冒烟：并发 | ✅ C8 三轮无失败请求 |
+| 73 万 token 文档埋点检索 | ✅ 全部命中 |
+| 标称上下文 | 1,048,576 token |
+| 实际交互上限 | ≈300K（超过后首 token 延迟显著上升） |
+| 多跳推理（1M 上下文） | ❌ 多跳相加、10 级变量追踪失败 |
+| 检索类任务 | ✅ 满血 |
+
+### 5.4 模型质量（历史测试）
+
+| 项目 | 结果 | 备注 |
+|---|---|---|
+| GSM8K | **97%** | 数学应用题 |
+| MATH-500 | **84%** | 严格判分；早期版本因 `\boxed{}` 嵌套解析错误曾报 77% |
+| 指令遵循 | 9/10 | 10 项严格格式测试 |
+| 代码任务 | 全部通过 | 可执行且结果正确 |
+| JSON 输出 | ⚠️ 需强制约束 | 不加提示易附解释文字 |
+
+### 5.5 稳定性
+
+| 项目 | 结果 |
+|---|---|
+| 连续运行 | 2 小时无崩溃，容器 healthy |
+| C8 压测 | 全部成功，零失败 |
+| 显存 | 无 OOM、无 NVRM Xid |
 
 ---
 
-## 十、已知边界与注意事项
+## 6. 测试方法与口径
 
-1. **预填充是四机方案的短板**：真实预填约 5,000 tok/s，长文档（>100K）首 token 要等 20 秒以上，
-   高频长文档场景需要 6000D 做 P 节点（预填可提升 1.7 倍）。
-2. **1M 上下文不是实用上限**：73 万 token 可用，但 196 秒首字延迟决定了它只适合
-   离线批处理，不适合交互。
-3. **JSON 输出需要强约束**：默认有 40% 概率在 JSON 前后加解释文字。
-4. **思考模式默认关闭**：该权重开思考准确率不升反降（旧模型实测 GSM8K 98→97、
-   MATH-500 77→72~75，token +31~76%），能力保留但生产不建议开。
-5. **中文散文速度低于代码**：中文场景约 50–60 tok/s，做 QPS 预估要按这个算，
-   不能按代码场景的 107 tok/s 算。
+1. **解码**：`stream=true`、`stream_options.include_usage=true`、`temperature=0`、固定代码提示词、`max_tokens=512`；TTFT 从首个 token 起算并剔除；每档 3 轮取中位数。
+2. **预填**：`max_tokens=1` 非流式；prompt 前置 `[req <uuid>]` 破坏 prefix cache；同时读 `usage.prompt_tokens` 与 `prompt_tokens_details.cached_tokens`，**cached 必须为 0** 才计入。
+3. **长上下文**：长文档中埋 5 个唯一标记，检验召回率。
+4. **质量**：GSM8K 500 题子集、MATH-500 全量、代码题人工执行验证。
+
+> 为什么预填要这么测：不做 nonce 前缀、不查 cached_tokens，很容易把"缓存命中"测成 2 万 tok/s 的假数据。
 
 ---
 
-## 十一、复现方法
+## 7. 已知问题与局限
+
+| 问题 | 说明 |
+|---|---|
+| 4×TP 各自拉全量 KV | MLA 单 KV head 无法按 head 切分，KV 冗余 4.28× |
+| 1M 下组合推理退化 | 多跳相加、10 级变量追踪失败；检索满血 |
+| `max_completion_tokens` 不兼容 | 代理忽略该字段，必须用 `max_tokens` |
+| 长 prompt 首字延迟高 | 125K 输入 TTFT 24.8 s，无独立 Prefill 节点 |
+| 并发与长度互斥 | KV 池 100 万 token，32 并发时每请求仅 3.1 万 |
+
+---
+
+## 8. 复现步骤
 
 ```bash
-# 启动（.134 上）
-cd /home/aidgx/dsv41-tp4
-./start-solo.sh serve
-
-# 健康检查
-curl http://10.0.0.X:8888/health
-
-# 基准测试
-python3 bench_solo_mxfp4.py http://10.0.0.X:8888
-
-# 长上下文
-python3 test_long_solo.py http://10.0.0.X:8888 200000 600000
-
-# 质量
-BASE=http://10.0.0.X:8888/v1 python3 gsm8k_think.py 100 tag 0
-BASE=http://10.0.0.X:8888/v1 python3 math500_v2.py 100 plain
-BASE=http://10.0.0.X:8888/v1 python3 model_tests.py
-BASE=http://10.0.0.X:8888/v1 python3 model_tests2.py
-BASE=http://10.0.0.X:8888/v1 python3 model_tests3.py
+# 1. 四台同路径放权重（/models/DeepSeek-V4.1-Flash），逐文件校验大小
+# 2. 确认 RoCE 互通：ping 10.10.10.x + ib_write_bw
+# 3. rank 0 起 head，rank 1-3 起 worker，--dist-init-addr 指向 rank 0
+# 4. 等 /health 返回 200（首次加载 6–10 分钟）
+# 5. 先跑带 nonce 的预填脚本，确认 cached_tokens=0 再采信数字
 ```
 
-**当前对外入口**：`http://10.0.0.X:5701/v1`（模型名 `deepseek-v4.1-flash`，key 任意）
+---
+
+## 9. 数据来源
+
+| 内容 | 来源 |
+|---|---|
+| 硬件规格 | NVIDIA 官方 `docs.nvidia.com/dgx/dgx-spark/hardware.html` |
+| 模型规格 | 权重仓库文件清单 + `config.json` |
+| 其余全部数字 | 本机实测（四台 DGX Spark） |
+
+*报告生成：2026-10-26　交流群：QQ 1128010665*
